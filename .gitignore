@@ -1,3 +1,16 @@
+# ── KeyDNA project-specific ─────────────────────────────────────────
+# Sensitive user data (password hashes, biometric models)
+data/user_profile.*
+data/theme.txt
+
+# Build/distribution bloat
+zipfile/
+zipfile.zip
+
+# Keep KeyDNA.spec tracked despite *.spec rule below
+!KeyDNA.spec
+
+# ── Python standard ─────────────────────────────────────────────────
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

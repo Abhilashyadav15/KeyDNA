@@ -1,17 +1,38 @@
 """
-KeyDNA — Desktop App (CustomTkinter)
+KeyDNA — Desktop App (v2 — Unified Model)
 Real keyboard capture via pynput bound to Tkinter Entry widgets.
-All 14 fixes active. 10 samples per mood. Real KNN training.
+
+ARCHITECTURE:
+  NO mood classifier. Single unified model.
+  27-feature extraction. One-Class SVM scoring.
+  Strict thresholds. Information hiding.
+
+ENROLLMENT:
+  10 typing samples → all stored in single unified model.
+  No mood prompts. Type your password naturally.
+
+AUTHENTICATION:
+  Password (bcrypt) + Typing Rhythm (SVM)
+  Score > 0.00 ACCEPT | > -0.01 RETRY | <= -0.01 REJECT
+
+SECURITY:
+  - bcrypt password hashing (salted, slow by design)
+  - PBKDF2 salted security question answers
+  - Fernet AES-encrypted profile storage
+  - Never show confidence or score to user
+  - Generic "Authentication failed" on all rejections
+  - Adaptive attack detection
+  - Replay detection
+  - 3 attempts then fallback
 """
 
 import sys
 import os
-import json
 import time
-import hashlib
 import threading
 import tkinter as tk
 from tkinter import messagebox
+from typing import Tuple
 
 # ── Dependency checks ──────────────────────────────────────────────────
 missing = []
@@ -27,11 +48,9 @@ except ImportError:
 
 try:
     import numpy as np
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.neighbors import KNeighborsClassifier
-    from sklearn.preprocessing import StandardScaler
 except ImportError:
-    missing.append("scikit-learn / numpy")
+    missing.append("numpy")
+
 
 if missing:
     root = tk.Tk(); root.withdraw()
@@ -45,91 +64,70 @@ if missing:
 # ── Backend imports ─────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.features import FeatureExtractor
-from models.mood_classifier import MoodClassifier
-from models.knn_auth import KNNAuthenticator
-from enrollment.enroller import EnrollmentSession
-from authentication.fallback import (
-    FallbackEnrollment, FallbackSession,
-    SECURITY_QUESTIONS, QUESTIONS_TO_CHOOSE
+from core.security import (
+    hash_password, verify_password,
+    save_encrypted_profile, load_encrypted_profile,
 )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# CONSTANTS & THEME
-# ═══════════════════════════════════════════════════════════════════════
-
-SAMPLES_PER_MOOD = 10
-MOODS_ORDER      = ["RELAXED", "FOCUSED", "STRESSED", "TIRED"]
-MAX_ATTEMPTS     = 3
-SESSION_TIMEOUT  = 300   # seconds
-DATA_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "data", "user_profile.json")
-
-MOOD_COLORS = {
-    "RELAXED":  "#10b981",
-    "FOCUSED":  "#3b82f6",
-    "STRESSED": "#ef4444",
-    "TIRED":    "#f59e0b",
-}
-MOOD_DESC = {
-    "RELAXED":  "Type naturally, as if on a relaxed quiet morning.",
-    "FOCUSED":  "Type carefully, as if concentrating on important work.",
-    "STRESSED": "Type quickly, as if rushing before a deadline.",
-    "TIRED":    "Type slowly, as if exhausted late at night.",
-}
-
-C_BG      = "#080c14"
-C_CARD    = "#0e1420"
-C_BORDER  = "#1a2436"
-C_ACCENT  = "#00d4ff"
-C_TEXT    = "#e8eaf0"
-C_SUB     = "#94a3b8"
-C_GREEN   = "#10b981"
-C_RED     = "#ef4444"
-C_YELLOW  = "#f59e0b"
+from models.auth_model import UnifiedAuthModel
+from enrollment.enroller import EnrollmentSession
+from authentication.fallback import FallbackEnrollment, FallbackSession
+from config import (
+    ENROLLMENT_SAMPLES, MAX_ATTEMPTS, SESSION_TIMEOUT, DATA_FILE,
+    SECURITY_QUESTIONS, QUESTIONS_TO_CHOOSE, THEME_FILE, DATA_DIR,
+    C_BG, C_CARD, C_BORDER, C_ACCENT, C_TEXT, C_SUB,
+    C_GREEN, C_RED, C_YELLOW, C_PURPLE, C_DIM,
+    WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, WINDOW_DEFAULT_GEOMETRY,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════
 
-def _hash(v):
-    return hashlib.sha256(v.strip().lower().encode()).hexdigest()
+def save_profile(p: dict) -> None:
+    """Save profile as encrypted binary file."""
+    save_encrypted_profile(p, DATA_FILE)
 
-def save_profile(p):
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    with open(DATA_FILE, "w") as f:
-        json.dump(p, f)
+def load_profile() -> dict:
+    """Load profile from encrypted file (with legacy JSON fallback)."""
+    return load_encrypted_profile(DATA_FILE)
 
-def load_profile():
-    try:
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
+def rebuild_model(model_data: dict) -> UnifiedAuthModel:
+    """Rebuild UnifiedAuthModel from saved profile data."""
+    model: UnifiedAuthModel = UnifiedAuthModel()
+    if model_data:
+        samples_list = model_data if isinstance(model_data, list) else model_data.get('samples', [])
+        model.load_samples(samples_list)
+    return model
 
-def serialize_knn(mood_samples: dict) -> dict:
-    return {mood: [s.tolist() for s in samples]
-            for mood, samples in mood_samples.items()}
-
-def rebuild_knn(knn_data: dict) -> KNNAuthenticator:
-    knn = KNNAuthenticator()
-    for mood, samples_list in knn_data.items():
-        for s in samples_list:
-            knn.enroll(np.array(s), mood)
-    return knn
-
-def pw_strength(pw):
+def pw_strength(pw: str) -> Tuple[int, str, str]:
+    """Return (score, label, color) for password strength."""
     if not pw: return 0, "", C_BORDER
-    s = 0
+    s: int = 0
     if len(pw) >= 8:                              s += 1
     if any(c.isdigit() for c in pw):              s += 1
     if any(c in "!@#$%^&*_-+=" for c in pw):     s += 1
-    labels = ["", "Weak", "Medium", "Strong"]
-    colors = [C_BORDER, C_RED, C_YELLOW, C_GREEN]
+    labels: list = ["", "Weak", "Medium", "Strong"]
+    colors: list = [C_BORDER, C_RED, C_YELLOW, C_GREEN]
     return s, labels[s], colors[s]
+
+def _load_theme() -> str:
+    """Load saved theme preference. Defaults to dark."""
+    try:
+        if os.path.exists(THEME_FILE):
+            with open(THEME_FILE, "r") as f:
+                theme = f.read().strip()
+                if theme in ("dark", "light"):
+                    return theme
+    except Exception:
+        pass
+    return "dark"
+
+def _save_theme(theme: str) -> None:
+    """Persist theme preference."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(THEME_FILE, "w") as f:
+        f.write(theme)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -140,7 +138,7 @@ class KeystrokeCapture:
     """
     Captures real keyboard timing from a Tkinter Entry widget.
     Binds directly to the widget's KeyPress / KeyRelease events.
-    Privacy Fix #13: key content anonymized, only timing stored.
+    Privacy: key content anonymized, only timing stored.
     """
 
     def __init__(self):
@@ -158,7 +156,7 @@ class KeystrokeCapture:
         self.active = True
 
     def _anon_key(self, keysym: str) -> str:
-        """Anonymize key to position id. Fix #13."""
+        """Anonymize key to position id."""
         if keysym in ("BackSpace", "Delete"):
             return "backspace"
         with self._lock:
@@ -240,7 +238,7 @@ class BaseFrame(ctk.CTkFrame):
                      font=ctk.CTkFont(family="Courier", size=22, weight="bold"),
                      text_color=C_TEXT).pack()
         ctk.CTkLabel(parent, text="your rhythm is your key",
-                     font=ctk.CTkFont(size=11), text_color="#2d3748").pack(pady=(2,0))
+                     font=ctk.CTkFont(size=11), text_color=C_DIM).pack(pady=(2,0))
 
     def make_card(self, parent, **kwargs):
         return ctk.CTkFrame(parent, fg_color=C_CARD,
@@ -259,7 +257,7 @@ class BaseFrame(ctk.CTkFrame):
                             fg_color="#0a0f1a",
                             border_color=C_BORDER,
                             text_color=C_TEXT,
-                            placeholder_text_color="#2d3748",
+                            placeholder_text_color=C_DIM,
                             font=ctk.CTkFont(family="Courier", size=13),
                             height=40, **kw)
 
@@ -337,13 +335,14 @@ class BaseFrame(ctk.CTkFrame):
 class LoginScreen(BaseFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        self._capture    = KeystrokeCapture()
-        self._msg_widget = None
-        self._dots_frame = None
+        self._capture        = KeystrokeCapture()
+        self._msg_widget     = None
+        self._dots_frame     = None
+        self._auth_model     = None
+        self._auto_submit_id = None
         self._build()
 
     def _build(self):
-        # Scrollable center column
         wrap = ctk.CTkFrame(self, fg_color=C_BG)
         wrap.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.88)
 
@@ -357,12 +356,14 @@ class LoginScreen(BaseFrame):
         inner.pack(fill="x", padx=22, pady=20)
 
         self.make_label(inner, "SIGN IN", size=10,
-                        color="#2d3748").pack(anchor="w", pady=(0,8))
+                        color=C_DIM).pack(anchor="w", pady=(0,8))
 
         self._pw_entry = self.make_entry(inner, placeholder="Enter your password",
                                          show="●")
         self._pw_entry.pack(fill="x", pady=(0, 6))
         self._capture.attach(self._pw_entry)
+        self._pw_entry.bind("<KeyRelease>", self._auto_submit, add="+")
+        self._pw_entry.bind("<Return>", lambda e: self._on_enter())
 
         self._msg_area = ctk.CTkFrame(inner, fg_color="transparent")
         self._msg_area.pack(fill="x")
@@ -383,10 +384,23 @@ class LoginScreen(BaseFrame):
                            self._on_enroll).pack(side="right")
 
     def on_show(self):
+        # Cancel any pending auto-submit from previous session
+        if self._auto_submit_id:
+            self.after_cancel(self._auto_submit_id)
+            self._auto_submit_id = None
+
         self._capture.reset()
         self._pw_entry.delete(0, "end")
         self._clear_msg()
         self._refresh_dots()
+        
+        # Initialize model once per login screen session to maintain recent_scores history
+        profile = self.app.profile
+        model_data = profile.get("model_data")
+        if model_data:
+            self._auth_model = rebuild_model(model_data)
+        else:
+            self._auth_model = None
 
     def _refresh_dots(self):
         for w in self._dots_area.winfo_children():
@@ -406,6 +420,77 @@ class LoginScreen(BaseFrame):
         for w in self._msg_area.winfo_children():
             w.destroy()
 
+    def _auto_submit(self, event=None):
+        """Check on every keystroke — password hash acts as the gate."""
+        if self._auto_submit_id:
+            self.after_cancel(self._auto_submit_id)
+        self._auto_submit_id = self.after(50, self._do_auto_submit)
+
+    def _do_auto_submit(self):
+        """
+        SHA-256 hash gate auto-submit.
+        - On every keystroke, check SHA-256(typed) vs stored hash (< 1ms)
+        - Hash doesn't match → user still typing → do nothing
+        - Hash matches → password complete → check rhythm → login or reject
+        """
+        self._auto_submit_id = None
+
+        if not self._auth_model:
+            return
+
+        password = self._pw_entry.get()
+        if not password:
+            return
+
+        profile = self.app.profile
+        if not profile.get("password_hash"):
+            return
+
+        # ── Hash gate: only proceeds when EXACT password is typed ──
+        if not verify_password(password, profile.get("password_hash")):
+            return  # partial/wrong password → do nothing, wait for more typing
+
+        # ── Password complete! Check rhythm immediately ──
+        events = self._capture.get_events()
+        if len(events) < 4:
+            return
+
+        extractor = FeatureExtractor()
+        features  = extractor.extract(events)
+
+        if features is None:
+            return
+
+        # Replay detection
+        if extractor.get_consistency_score(features) >= 0.97:
+            self.app.failed_attempts += 1
+            self._refresh_dots()
+            self._show_msg("Authentication failed.", "err")
+            self._pw_entry.delete(0, "end")
+            self._capture.reset()
+            return
+
+        result = self._auth_model.authenticate(features)
+
+        if result["decision"] == "ACCEPT":
+            # Password + rhythm matched → auto-login!
+            self.app.failed_attempts = 0
+            self.app.auth_verified = True
+            self.app.show("success")
+        else:
+            # Password correct but rhythm rejected → immediate reject
+            self.app.failed_attempts += 1
+            fa = self.app.failed_attempts
+            self._refresh_dots()
+            if fa >= MAX_ATTEMPTS:
+                self.app.failed_attempts = 0
+                self._go_fallback()
+            else:
+                self._show_msg("Authentication failed.", "err")
+            self._pw_entry.delete(0, "end")
+            self._capture.reset()
+
+
     def _on_enter(self):
         events   = self._capture.get_events()
         password = self._pw_entry.get()
@@ -418,7 +503,7 @@ class LoginScreen(BaseFrame):
             self._show_msg("Please enter your password.", "err")
             return
 
-        if _hash(password) != profile.get("password_hash"):
+        if not verify_password(password, profile.get("password_hash")):
             self.app.failed_attempts += 1
             fa = self.app.failed_attempts
             self._refresh_dots()
@@ -426,70 +511,100 @@ class LoginScreen(BaseFrame):
                 self.app.failed_attempts = 0
                 self._go_fallback()
             else:
-                self._show_msg(
-                    f"Wrong password. {MAX_ATTEMPTS - fa} attempt(s) left.", "err")
+                # SECURITY: Generic failure message
+                self._show_msg("Authentication failed.", "err")
             self._pw_entry.delete(0, "end")
             self._capture.reset()
             return
 
-        # Password correct — verify rhythm
-        knn_data = profile.get("knn_data")
-        extractor = FeatureExtractor()
+        # Verify rhythm
+        model_data = profile.get("model_data")
+        extractor  = FeatureExtractor()
 
-        if knn_data and len(events) >= 4:
-            features      = extractor.extract(events)
-            mood_features = extractor.extract_mood_features(events)
+        if model_data and len(events) >= 4:
+            features = extractor.extract(events)
 
-            if features is not None and mood_features is not None:
-                # Fix #6: replay detection
+            if features is not None:
+                # Replay detection
                 consistency = extractor.get_consistency_score(features)
                 if consistency >= 0.97:
                     self.app.failed_attempts += 1
                     self._refresh_dots()
-                    self._show_msg("Replay attack detected. Access denied.", "err")
+                    # SECURITY: Generic failure message — no details
+                    self._show_msg("Authentication failed.", "err")
                     self._pw_entry.delete(0, "end")
                     self._capture.reset()
                     return
 
-                knn  = rebuild_knn(knn_data)
-                mc   = self.app.mood_classifier
-                mood, mood_conf = mc.predict(mood_features)
-                result = knn.authenticate(features, mood, mood_conf)
+                if self._auth_model is None and model_data:
+                    self._auth_model = rebuild_model(model_data)
 
-                if result["decision"] == "ACCEPT":
-                    self.app.failed_attempts = 0
-                    self.app.rhythm_result   = {
-                        "mood":       mood,
-                        "confidence": result["confidence"],
-                        "real":       True,
-                    }
-                    self.app.show("success")
-                    return
-                else:
-                    self.app.failed_attempts += 1
-                    fa = self.app.failed_attempts
-                    self._refresh_dots()
-                    if fa >= MAX_ATTEMPTS:
+                if self._auth_model is not None:
+                    result = self._auth_model.authenticate(features)
+
+                    if result["decision"] == "ACCEPT":
                         self.app.failed_attempts = 0
-                        self._go_fallback()
+                        self.app.auth_verified = True
+                        self.app.show("success")
+                        return
                     else:
-                        self._show_msg(
-                            f"Rhythm not recognized. {MAX_ATTEMPTS-fa} attempt(s) left.",
-                            "err")
-                    self._pw_entry.delete(0, "end")
-                    self._capture.reset()
-                    return
+                        # REJECT or RETRY — treat both as failed attempt
+                        self.app.failed_attempts += 1
+                        fa = self.app.failed_attempts
+                        self._refresh_dots()
+                        if fa >= MAX_ATTEMPTS:
+                            self.app.failed_attempts = 0
+                            self._go_fallback()
+                        else:
+                            self._show_msg("Authentication failed.", "err")
+                        self._pw_entry.delete(0, "end")
+                        self._capture.reset()
+                        return
 
-        # No rhythm enrolled or not enough events — password alone
-        self.app.failed_attempts  = 0
-        self.app.rhythm_result    = None
+                # Model couldn't be built — reject (should not happen normally)
+                self.app.failed_attempts += 1
+                fa = self.app.failed_attempts
+                self._refresh_dots()
+                if fa >= MAX_ATTEMPTS:
+                    self.app.failed_attempts = 0
+                    self._go_fallback()
+                else:
+                    self._show_msg("Authentication failed.", "err")
+                self._pw_entry.delete(0, "end")
+                self._capture.reset()
+                return
+
+        # No rhythm enrolled or not enough keystroke events
+        # If model is enrolled but events < 4, still reject (don't allow password-only bypass)
+        model_data = profile.get("model_data")
+        if model_data:
+            self.app.failed_attempts += 1
+            fa = self.app.failed_attempts
+            self._refresh_dots()
+            if fa >= MAX_ATTEMPTS:
+                self.app.failed_attempts = 0
+                self._go_fallback()
+            else:
+                self._show_msg("Authentication failed. Type your full password.", "err")
+            self._pw_entry.delete(0, "end")
+            self._capture.reset()
+            return
+
+        # Truly no rhythm enrolled — password alone (first-time setup only)
+        self.app.failed_attempts = 0
+        self.app.auth_verified   = False
         self.app.show("success")
 
     def _go_fallback(self):
         profile = self.app.profile
-        self.app.fallback_session = FallbackSession(
-            FallbackEnrollment.from_dict(profile["fallback"]))
-        self.app.show("fallback")
+        if profile.get("fallback"):
+            self.app.fallback_session = FallbackSession(
+                FallbackEnrollment.from_dict(profile["fallback"]))
+            self.app.show("fallback")
+        else:
+            self._show_msg(
+                "Too many failed attempts. No fallback enrolled. "
+                "Please contact support.", "err")
 
     def _on_forgot(self):
         if not self.app.profile.get("password_hash"):
@@ -509,22 +624,22 @@ class LoginScreen(BaseFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ENROLL SCREEN
+# ENROLL SCREEN  (Unified — no mood classification)
 # ═══════════════════════════════════════════════════════════════════════
 
 class EnrollScreen(BaseFrame):
     def __init__(self, master, app):
         super().__init__(master, app)
-        self._step          = 1
-        self._password      = ""
-        self._fe            = FallbackEnrollment()
-        self._mood_idx      = 0
-        self._mood_samples  = {}   # mood → [feature vectors]
-        self._enroll_session= None
-        self._capture       = KeystrokeCapture()
-        self._q_order       = []
-        self._q_answers     = []
-        self._content_frame = None
+        self._step           = 1
+        self._password       = ""
+        self._fe             = FallbackEnrollment()
+        self._samples        = []     # collected feature vectors
+        self._enroll_session = None
+        self._capture        = KeystrokeCapture()
+        self._q_order        = []
+        self._q_answers      = []
+        self._content_frame  = None
+        self._rhythm_only    = False   # skip questions when re-enrolling rhythm
         self._build_shell()
 
     def _build_shell(self):
@@ -555,19 +670,24 @@ class EnrollScreen(BaseFrame):
         self._back_btn.pack(pady=8)
 
     def on_show(self):
-        self._step         = 1
-        self._password     = ""
-        self._fe           = FallbackEnrollment()
-        self._mood_idx     = 0
-        self._mood_samples = {}
-        self._q_order      = []
-        self._q_answers    = []
+        self._step          = 1
+        self._password      = ""
+        self._fe            = FallbackEnrollment()
+        self._samples       = []
+        self._q_order       = []
+        self._q_answers     = []
+        self._trusted_name  = ""
+        self._trusted_email = ""
+        self._rhythm_only   = False
+        self._enroll_session = None
         self._render()
 
     def _render(self):
+        TOTAL_STEPS = 4
+
         # Update dots
         for w in self._dots_row.winfo_children(): w.destroy()
-        for i in range(4):
+        for i in range(TOTAL_STEPS):
             color = C_GREEN  if i < self._step-1 else \
                     C_ACCENT if i == self._step-1 else C_BORDER
             ctk.CTkLabel(self._dots_row, text="●",
@@ -575,7 +695,7 @@ class EnrollScreen(BaseFrame):
                          text_color=color).pack(side="left", padx=3)
 
         # Update progress bar
-        pct = (self._step - 1) / 4
+        pct = (self._step - 1) / TOTAL_STEPS
         self._prog_inner.place(relx=0, rely=0,
                                relwidth=max(0.01, pct), relheight=1)
 
@@ -594,7 +714,7 @@ class EnrollScreen(BaseFrame):
     # ── Step 1: Password ────────────────────────────────────────────
     def _build_step1(self, p):
         self.make_label(p, "STEP 1 OF 4 — SET YOUR PASSWORD",
-                        size=10, color="#2d3748").pack(anchor="w", pady=(0,10))
+                        size=10, color=C_DIM).pack(anchor="w", pady=(0,10))
 
         self.make_label(p, "New password").pack(anchor="w")
         self._e_pw1 = self.make_entry(p, show="●")
@@ -641,38 +761,28 @@ class EnrollScreen(BaseFrame):
         self._step = 2
         self._render()
 
-    # ── Step 2: Rhythm Enrollment ────────────────────────────────────
+    # ── Step 2: Unified Rhythm Enrollment ────────────────────────────
     def _build_step2(self, p):
-        if self._mood_idx >= len(MOODS_ORDER):
+        n = len(self._samples)
+        remaining = ENROLLMENT_SAMPLES - n
+
+        if n >= ENROLLMENT_SAMPLES:
             self._build_step2_done(p)
             return
 
-        mood  = MOODS_ORDER[self._mood_idx]
-        color = MOOD_COLORS[mood]
-        n     = len(self._mood_samples.get(mood, []))
-        remaining = SAMPLES_PER_MOOD - n
-
         # ── Header ──
         self.make_label(p,
-            f"STEP 2 OF 4 — RHYTHM ENROLLMENT  "
-            f"({self._mood_idx+1}/{len(MOODS_ORDER)} moods)",
-            size=10, color="#2d3748").pack(anchor="w", pady=(0,10))
+            f"STEP 2 OF 4 — RHYTHM ENROLLMENT",
+            size=10, color=C_DIM).pack(anchor="w", pady=(0,10))
 
-        # ── Mood name + description ──
-        mf = ctk.CTkFrame(p, fg_color="transparent")
-        mf.pack(fill="x", pady=(0,4))
-        ctk.CTkLabel(mf, text="●", font=ctk.CTkFont(size=18),
-                     text_color=color).pack(side="left", padx=(0,8))
-        ctk.CTkLabel(mf, text=mood,
-                     font=ctk.CTkFont(size=16, weight="bold"),
-                     text_color=color).pack(side="left")
-
-        self.make_label(p, MOOD_DESC[mood],
-                        size=12, color=C_SUB).pack(anchor="w", pady=(0,14))
+        self.make_label(p,
+            "Type your password naturally. Each attempt teaches the\n"
+            "system your unique typing rhythm. No rushing needed.",
+            size=12, color=C_SUB).pack(anchor="w", pady=(0,14))
 
         # ── BIG COUNTDOWN NUMBER ──
         count_frame = ctk.CTkFrame(p, fg_color=C_CARD,
-                                   border_color=color, border_width=2,
+                                   border_color=C_ACCENT, border_width=2,
                                    corner_radius=16)
         count_frame.pack(fill="x", pady=(0, 12))
 
@@ -683,12 +793,12 @@ class EnrollScreen(BaseFrame):
             inner_cf,
             text=str(remaining),
             font=ctk.CTkFont(family="Courier", size=64, weight="bold"),
-            text_color=color)
+            text_color=C_ACCENT)
         self._countdown_num.pack()
 
         self._countdown_sub = ctk.CTkLabel(
             inner_cf,
-            text=f"time{'s' if remaining != 1 else ''} remaining",
+            text=f"sample{'s' if remaining != 1 else ''} remaining",
             font=ctk.CTkFont(size=12),
             text_color=C_SUB)
         self._countdown_sub.pack()
@@ -703,26 +813,23 @@ class EnrollScreen(BaseFrame):
         # ── Password entry ──
         self._e_type = self.make_entry(
             p,
-            placeholder=f"Type as if {mood.lower()}... then press Enter",
+            placeholder="Type your password... then press Enter",
             show="●")
         self._e_type.pack(fill="x", pady=(0, 6))
         self._capture.reset()
         self._capture.attach(self._e_type)
         self._e_type.focus()
 
-        # Pressing Enter captures the sample automatically
+        # Pressing Enter captures the sample
         self._e_type.bind("<Return>", lambda e: self._capture_sample())
 
         # ── Feedback message area ──
         self._msg2 = ctk.CTkFrame(p, fg_color="transparent")
         self._msg2.pack(fill="x")
 
-        # ── Skip link ──
-        self.make_link_btn(p, f"Skip {mood} mood →",
-                           self._skip_mood).pack(anchor="e", pady=(6,0))
-
-        # ── Enroll session for quality checks ──
-        self._enroll_session = EnrollmentSession(mood, SAMPLES_PER_MOOD)
+        # ── Enroll session ──
+        if self._enroll_session is None:
+            self._enroll_session = EnrollmentSession(ENROLLMENT_SAMPLES)
 
     def _capture_sample(self):
         """Called on Enter key press — captures one sample."""
@@ -745,7 +852,7 @@ class EnrollScreen(BaseFrame):
             self.msg(self._msg2, "Could not extract features. Try again.", "err")
             return
 
-        # Fix #14: autofill / paste detection
+        # Autofill / paste detection
         total_ms = (events[-1]["release"] - events[0]["press"]) * 1000
         cons     = extractor.get_consistency_score(features)
         if total_ms < 50 or cons >= 0.99:
@@ -753,123 +860,81 @@ class EnrollScreen(BaseFrame):
                      "Autofill or paste detected. Please type manually.", "warn")
             return
 
-        # Quality check
-        result = self._enroll_session.process_attempt(events)
-        if not result["accepted"]:
-            self.msg(self._msg2, result["feedback"], "warn")
-            return
-
         # ── Store sample ──
-        mood = MOODS_ORDER[self._mood_idx]
-        if mood not in self._mood_samples:
-            self._mood_samples[mood] = []
-        self._mood_samples[mood].append(features)
+        self._samples.append(features)
 
-        n         = len(self._mood_samples[mood])
-        remaining = SAMPLES_PER_MOOD - n
+        n         = len(self._samples)
+        remaining = ENROLLMENT_SAMPLES - n
 
         # ── Update countdown ──
-        color = MOOD_COLORS[mood]
         if remaining > 0:
             self._countdown_num.configure(
                 text=str(remaining),
-                text_color=color if remaining > 3 else C_YELLOW)
+                text_color=C_ACCENT if remaining > 3 else C_YELLOW)
             self._countdown_sub.configure(
-                text=f"time{'s' if remaining != 1 else ''} remaining")
+                text=f"sample{'s' if remaining != 1 else ''} remaining")
             self.msg(self._msg2, f"✓  Sample {n} captured", "ok")
         else:
-            # All 10 done — flash green then move on
+            # All done — flash green then move on
             self._countdown_num.configure(text="✓", text_color=C_GREEN)
             self._countdown_sub.configure(
-                text=f"{mood} complete!", text_color=C_GREEN)
+                text="Enrollment complete!", text_color=C_GREEN)
             self.msg(self._msg2,
-                     f"All 10 samples captured for {mood} ✓", "ok")
-            self.after(1200, self._next_mood)
+                     f"All {ENROLLMENT_SAMPLES} samples captured ✓", "ok")
+            self.after(1200, self._finish_rhythm)
 
-    def _skip_mood(self):
-        self._mood_idx += 1
-        self._render()
-
-    def _next_mood(self):
-        self._mood_idx += 1
+    def _finish_rhythm(self):
+        self._step = 2  # will show done view
         self._render()
 
     def _build_step2_done(self, p):
         self.make_label(p, "STEP 2 OF 4 — RHYTHM ENROLLMENT",
-                        size=10, color="#2d3748").pack(anchor="w", pady=(0,10))
-        self.msg(p, f"✓ Rhythm enrolled across "
-                    f"{len(self._mood_samples)} moods.", "ok")
-
-        for mood in MOODS_ORDER:
-            n     = len(self._mood_samples.get(mood, []))
-            color = MOOD_COLORS[mood]
-            row   = ctk.CTkFrame(p, fg_color="transparent")
-            row.pack(anchor="w", pady=2)
-            ctk.CTkLabel(row, text="●", font=ctk.CTkFont(size=11),
-                         text_color=color).pack(side="left", padx=(0,6))
-            ctk.CTkLabel(row, text=f"{mood}: {n} samples",
-                         font=ctk.CTkFont(size=12),
-                         text_color=C_TEXT if n > 0 else C_SUB).pack(side="left")
+                        size=10, color=C_DIM).pack(anchor="w", pady=(0,10))
+        self.msg(p, f"✓ {len(self._samples)} rhythm samples captured.", "ok")
 
         self.make_label(
             p,
-            "Training your personal KNN model on real captured data...",
+            "Building your personal authentication model\n"
+            "from real captured timing data...",
             size=11, color=C_SUB).pack(pady=(10,0))
 
-        self.make_btn(p, "TRAIN & CONTINUE", self._train_and_continue).pack(
+        self.make_btn(p, "BUILD MODEL & CONTINUE", self._build_model).pack(
             fill="x", pady=(10,0))
 
-    def _train_and_continue(self):
-        if not self._mood_samples:
-            messagebox.showerror("KeyDNA", "No samples collected. Please enroll at least one mood.")
+    def _build_model(self):
+        if not self._samples or len(self._samples) < 5:
+            messagebox.showerror("KeyDNA",
+                "Not enough samples. Please provide at least 5.")
             return
-        knn = KNNAuthenticator()
-        for mood, samples in self._mood_samples.items():
-            for s in samples:
-                knn.enroll(s, mood)
-        self.app.knn          = knn
-        self.app.knn_data_ser = serialize_knn(self._mood_samples)
+
+        # Build unified model
+        model = UnifiedAuthModel()
+        for s in self._samples:
+            model.enroll(s)
+
+        self.app.auth_model   = model
+        self.app.model_data   = model.get_samples_serializable()
+
+        # If rhythm-only re-enrollment, skip questions/contact — save directly
+        if self._rhythm_only:
+            self._rhythm_only = False
+            self._do_save()
+            return
+
         self._step = 3
         self._render()
 
-    # ── Step 3: Backup PIN ───────────────────────────────────────────
+    # ── Step 3: Backup PIN + Security Questions ──────────────────────
     def _build_step3(self, p):
-        self.make_label(p, "STEP 3 OF 4 — BACKUP PIN",
-                        size=10, color="#2d3748").pack(anchor="w", pady=(0,10))
-        self.make_label(
-            p,
-            "Emergency access PIN — separate from your password.\n"
-            "6–12 digits. Used only when rhythm fails 3 times.",
-            size=12, color=C_SUB).pack(anchor="w", pady=(0,10))
-
-        self.make_label(p, "Backup PIN (6–12 digits)").pack(anchor="w")
-        self._e_pin = self.make_entry(p, placeholder="e.g. 847291", show="●")
-        self._e_pin.pack(fill="x", pady=(2,8))
-
-        self._msg3 = ctk.CTkFrame(p, fg_color="transparent")
-        self._msg3.pack(fill="x")
-
-        self.make_btn(p, "CONTINUE", self._step3_next).pack(fill="x", pady=(10,0))
-
-    def _step3_next(self):
-        for w in self._msg3.winfo_children(): w.destroy()
-        ok, msg = self._fe.set_pin(self._e_pin.get())
-        if ok:
-            self._step = 4
-            self._render()
-        else:
-            self.msg(self._msg3, msg, "err")
-
-    # ── Step 4: Security Questions ───────────────────────────────────
-    def _build_step4(self, p):
         q_num = len(self._q_order) + 1
 
         if q_num > QUESTIONS_TO_CHOOSE:
-            self._build_step4_confirm(p)
+            self._build_step3_confirm(p)
             return
 
-        self.make_label(p, "STEP 4 OF 4 — SECURITY QUESTIONS",
-                        size=10, color="#2d3748").pack(anchor="w", pady=(0,6))
+        # Question sub-step
+        self.make_label(p, "STEP 3 OF 4 — SECURITY QUESTIONS",
+                        size=10, color=C_DIM).pack(anchor="w", pady=(0,6))
         self.make_label(
             p,
             f"Choose question {q_num} of {QUESTIONS_TO_CHOOSE} and answer it.\n"
@@ -895,30 +960,30 @@ class EnrollScreen(BaseFrame):
         self._e_ans = self.make_entry(p, placeholder="Type your answer...")
         self._e_ans.pack(fill="x", pady=(2,8))
 
-        self._msg4 = ctk.CTkFrame(p, fg_color="transparent")
-        self._msg4.pack(fill="x")
+        self._msg3q = ctk.CTkFrame(p, fg_color="transparent")
+        self._msg3q.pack(fill="x")
 
         btn_lbl = "ADD QUESTION" if q_num < QUESTIONS_TO_CHOOSE else "DONE"
-        self.make_btn(p, btn_lbl, self._step4_add).pack(fill="x", pady=(8,0))
+        self.make_btn(p, btn_lbl, self._step3_add_question).pack(
+            fill="x", pady=(8,0))
 
-        # Store remaining for lookup
         self._q_remaining = remaining
 
-    def _step4_add(self):
-        for w in self._msg4.winfo_children(): w.destroy()
+    def _step3_add_question(self):
+        for w in self._msg3q.winfo_children(): w.destroy()
         sel_label = self._q_var.get()
         sel_idx   = next(i for i, q in self._q_remaining
                          if f"Q{i+1}: {q}" == sel_label)
         ans = self._e_ans.get().strip()
         if len(ans) < 2:
-            self.msg(self._msg4, "Answer too short.", "err"); return
+            self.msg(self._msg3q, "Answer too short.", "err"); return
         self._q_order.append(sel_idx)
         self._q_answers.append(ans)
         self._render()
 
-    def _build_step4_confirm(self, p):
-        self.make_label(p, "STEP 4 OF 4 — CONFIRM",
-                        size=10, color="#2d3748").pack(anchor="w", pady=(0,10))
+    def _build_step3_confirm(self, p):
+        self.make_label(p, "STEP 3 OF 4 — CONFIRM",
+                        size=10, color=C_DIM).pack(anchor="w", pady=(0,10))
         self.make_label(p, "All 3 questions chosen ✓",
                         size=13, color=C_GREEN, bold=True).pack(anchor="w", pady=(0,8))
 
@@ -939,30 +1004,80 @@ class EnrollScreen(BaseFrame):
                          font=ctk.CTkFont(size=11),
                          text_color=C_GREEN).pack(side="right")
 
-        self._msg4c = ctk.CTkFrame(p, fg_color="transparent")
-        self._msg4c.pack(fill="x", pady=6)
+        self._msg3c = ctk.CTkFrame(p, fg_color="transparent")
+        self._msg3c.pack(fill="x", pady=6)
 
-        self.make_btn(p, "SAVE & ACTIVATE", self._save_all).pack(
+        self.make_btn(p, "SAVE & CONTINUE", self._save_questions).pack(
             fill="x", pady=(8,0))
 
-    def _save_all(self):
-        for w in self._msg4c.winfo_children(): w.destroy()
+    def _save_questions(self):
+        for w in self._msg3c.winfo_children(): w.destroy()
         ok, msg = self._fe.set_questions(self._q_order, self._q_answers)
         if not ok:
-            self.msg(self._msg4c, msg, "err"); return
+            self.msg(self._msg3c, msg, "err"); return
+        self._step = 4
+        self._render()
 
-        knn_data = getattr(self.app, "knn_data_ser", {})
-        profile  = {
-            "password_hash": _hash(self._password),
-            "fallback":      self._fe.to_dict(),
-            "knn_data":      knn_data,
-            "knn_enrolled":  bool(knn_data),
+    # ── Step 4: Trusted Contact ─────────────────────────────────────
+    def _build_step4(self, p):
+        self.make_label(p, "STEP 4 OF 4 — TRUSTED CONTACT",
+                        size=10, color=C_DIM).pack(anchor="w", pady=(0,10))
+        self.make_label(
+            p,
+            "Last-resort recovery: if you forget your security\n"
+            "questions, a one-time code will be sent to this person.\n"
+            "They share it with you verbally to unlock your account.",
+            size=12, color=C_SUB).pack(anchor="w", pady=(0,12))
+
+        self.make_label(p, "Contact name (e.g. Mom, Dad, Friend)").pack(anchor="w")
+        self._e_tname = self.make_entry(p, placeholder="e.g. Mom")
+        self._e_tname.pack(fill="x", pady=(2,8))
+
+        self.make_label(p, "Their email address").pack(anchor="w")
+        self._e_temail = self.make_entry(p, placeholder="e.g. mom@example.com")
+        self._e_temail.pack(fill="x", pady=(2,8))
+
+        self._msg4 = ctk.CTkFrame(p, fg_color="transparent")
+        self._msg4.pack(fill="x")
+
+        self.make_btn(p, "SAVE & ACTIVATE", self._finish_enrollment).pack(
+            fill="x", pady=(10,0))
+        self.make_link_btn(p, "Skip (not recommended)",
+                           self._finish_enrollment_no_recovery).pack(pady=(6,0))
+
+    def _finish_enrollment(self):
+        for w in self._msg4.winfo_children(): w.destroy()
+        name  = self._e_tname.get().strip()
+        email = self._e_temail.get().strip()
+        ok, msg = self._fe.recovery.set_trusted_contact(name, email)
+        if not ok:
+            self.msg(self._msg4, msg, "err"); return
+        self._do_save()
+
+    def _finish_enrollment_no_recovery(self):
+        """Allow skipping trusted contact — recovery won't be available."""
+        self._do_save()
+
+    def _do_save(self):
+        model_data = getattr(self.app, "model_data", [])
+        existing   = self.app.profile or {}
+
+        fallback_dict = self._fe.to_dict() if self._fe.is_complete() \
+                        else existing.get("fallback", {})
+
+        pw_hash = hash_password(self._password) if self._password \
+                  else existing.get("password_hash", "")
+
+        profile = {
+            "password_hash": pw_hash,
+            "fallback":      fallback_dict,
+            "model_data":    model_data,
+            "model_enrolled": bool(model_data),
             "enrolled_at":   time.time(),
         }
         save_profile(profile)
         self.app.profile = profile
-        self.msg(self._msg4c, "Account created successfully!", "ok")
-        self.after(800, lambda: self.app.show("login"))
+        self.app.show("login")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -975,8 +1090,10 @@ class FallbackScreen(BaseFrame):
         self._build_shell()
 
     def _build_shell(self):
-        self._wrap = ctk.CTkFrame(self, fg_color=C_BG)
-        self._wrap.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.88)
+        self._wrap = ctk.CTkScrollableFrame(self, fg_color=C_BG,
+                                            scrollbar_button_color=C_BORDER)
+        self._wrap.place(relx=0.5, rely=0.5, anchor="center",
+                         relwidth=0.9, relheight=0.95)
         self.make_logo(self._wrap)
         ctk.CTkLabel(self._wrap, text="", height=8).pack()
         self._dots_row   = ctk.CTkFrame(self._wrap, fg_color="transparent")
@@ -988,8 +1105,8 @@ class FallbackScreen(BaseFrame):
                                         height=4, corner_radius=2)
         self._card = self.make_card(self._wrap)
         self._card.pack(fill="x", pady=4)
-        self.make_link_btn(self._wrap, "← Cancel",
-                           self._cancel).pack(pady=8)
+        self.make_btn(self._wrap, "Back to login page",
+                           self._back).pack(pady=8)
 
     def on_show(self):
         self._render()
@@ -1000,9 +1117,9 @@ class FallbackScreen(BaseFrame):
             self.app.show("login"); return
 
         stage   = session.stage
-        cur_map = {FallbackSession.STAGE_PIN:0, FallbackSession.STAGE_Q1:1,
-                   FallbackSession.STAGE_Q2:2, FallbackSession.STAGE_Q3:3,
-                   FallbackSession.STAGE_DONE:4}
+        cur_map = {FallbackSession.STAGE_Q1:0,
+                   FallbackSession.STAGE_Q2:1, FallbackSession.STAGE_Q3:2,
+                   FallbackSession.STAGE_RECOVERY:3, FallbackSession.STAGE_DONE:3}
         cur = cur_map.get(stage, 0)
 
         # Dots
@@ -1016,47 +1133,21 @@ class FallbackScreen(BaseFrame):
 
         # Progress
         self._prog_inner.place(relx=0, rely=0,
-                               relwidth=max(0.01, cur/4), relheight=1)
+                               relwidth=max(0.01, cur/3), relheight=1)
 
         # Card content
         for w in self._card.winfo_children(): w.destroy()
         inner = ctk.CTkFrame(self._card, fg_color="transparent")
         inner.pack(fill="x", padx=22, pady=20)
 
-        if stage == FallbackSession.STAGE_PIN:
-            self._build_pin(inner)
-        elif stage in (FallbackSession.STAGE_Q1,
+        if stage in (FallbackSession.STAGE_Q1,
                        FallbackSession.STAGE_Q2,
                        FallbackSession.STAGE_Q3):
             self._build_question(inner, stage)
+        elif stage == FallbackSession.STAGE_RECOVERY:
+            self._build_recovery(inner)
         elif stage == FallbackSession.STAGE_FAIL:
             self._build_fail(inner)
-
-    def _build_pin(self, p):
-        self.make_label(p, "FALLBACK STEP 1 OF 4 — BACKUP PIN",
-                        size=10, color="#2d3748").pack(anchor="w", pady=(0,10))
-        self.make_label(p, "Backup PIN").pack(anchor="w")
-        self._e_pin = self.make_entry(p, placeholder="Enter your backup PIN",
-                                      show="●")
-        self._e_pin.pack(fill="x", pady=(2,8))
-        self._e_pin.focus()
-        self._fb_msg = ctk.CTkFrame(p, fg_color="transparent")
-        self._fb_msg.pack(fill="x")
-        self.make_btn(p, "VERIFY PIN", self._verify_pin).pack(
-            fill="x", pady=(8,0))
-
-    def _verify_pin(self):
-        for w in self._fb_msg.winfo_children(): w.destroy()
-        r = self.app.fallback_session.verify_pin(self._e_pin.get())
-        if r["success"]:
-            self._render()
-        else:
-            if r.get("failed"):
-                self.app.fallback_session = None
-                self.app.show("login")
-                # show msg on login
-            else:
-                self.msg(self._fb_msg, r["message"], "err")
 
     def _build_question(self, p, stage):
         q_num   = {FallbackSession.STAGE_Q1:1,
@@ -1066,8 +1157,8 @@ class FallbackScreen(BaseFrame):
 
         self.make_label(
             p,
-            f"FALLBACK STEP {q_num+1} OF 4 — QUESTION {q_num}",
-            size=10, color="#2d3748").pack(anchor="w", pady=(0,6))
+            f"FALLBACK STEP {q_num} OF 4 — QUESTION {q_num}",
+            size=10, color=C_DIM).pack(anchor="w", pady=(0,6))
         self.make_label(
             p,
             f"Choose the question you picked {ordinal} during enrollment,\n"
@@ -1112,26 +1203,100 @@ class FallbackScreen(BaseFrame):
             sel_idx, self._e_qans.get())
 
         if r.get("authenticated"):
-            self.app.fallback_session   = None
-            self.app.needs_reenroll     = True
-            self.app.rhythm_result      = None
+            self.app.fallback_session = None
+            self.app.needs_reenroll   = True
+            self.app.auth_verified    = False
             self.app.show("success")
         elif r["success"]:
             self._render()
+        elif r.get("recovery_available"):
+            self._render()
+        elif r.get("failed"):
+            self.app.fallback_session = None
+            self.app.show("login")
         else:
-            if r.get("failed"):
-                self.app.fallback_session = None
-                self.app.show("login")
-            else:
-                self.msg(self._fb_msg2, r["message"], "err")
+            self.msg(self._fb_msg2, r["message"], "err")
+
+    def _build_recovery(self, p):
+        """Parental OTP recovery screen."""
+        session = self.app.fallback_session
+        has_contact = session.enrollment.has_recovery()
+
+        self.make_label(p, "LAST RESORT — TRUSTED CONTACT RECOVERY",
+                        size=10, color=C_DIM).pack(anchor="w", pady=(0,10))
+
+        if not has_contact:
+            self.msg(p,
+                "No trusted contact was enrolled for this account.\n"
+                "Account is fully locked. Contact support for a manual reset.",
+                "err")
+            self.make_btn(p, "BACK TO LOGIN",
+                          lambda: self.app.show("login")).pack(fill="x", pady=(12,0))
+            return
+
+        contact = session.enrollment.recovery
+        self.make_label(
+            p,
+            f"A one-time recovery code will be sent to {contact.trusted_name}\n"
+            f"({contact.masked_email()}).\n"
+            f"Ask them to share the code with you. Valid for 10 minutes.",
+            size=12, color=C_SUB).pack(anchor="w", pady=(0,12))
+
+        self._rec_msg = ctk.CTkFrame(p, fg_color="transparent")
+        self._rec_msg.pack(fill="x")
+
+        self._rec_otp_frame = ctk.CTkFrame(p, fg_color="transparent")
+        self._rec_otp_frame.pack(fill="x")
+
+        self.make_btn(p, f"SEND CODE TO {contact.trusted_name.upper()}",
+                      self._send_recovery_otp).pack(fill="x", pady=(10,4))
+
+    def _send_recovery_otp(self):
+        for w in self._rec_msg.winfo_children(): w.destroy()
+        for w in self._rec_otp_frame.winfo_children(): w.destroy()
+
+        r = self.app.fallback_session.request_recovery_otp()
+        if r["success"]:
+            self.msg(self._rec_msg, r["message"], "ok")
+            self.make_label(self._rec_otp_frame,
+                            "Enter the code shared by your trusted contact:"
+                            ).pack(anchor="w", pady=(12,0))
+            self._e_otp = self.make_entry(self._rec_otp_frame,
+                                          placeholder="6-digit code")
+            self._e_otp.pack(fill="x", pady=(2,8))
+            self._otp_msg = ctk.CTkFrame(self._rec_otp_frame, fg_color="transparent")
+            self._otp_msg.pack(fill="x")
+            self.make_btn(self._rec_otp_frame, "VERIFY CODE",
+                          self._verify_recovery_otp).pack(fill="x", pady=(8,0))
+        else:
+            self.msg(self._rec_msg, r["message"], "err")
+
+    def _verify_recovery_otp(self):
+        for w in self._otp_msg.winfo_children(): w.destroy()
+        r = self.app.fallback_session.verify_recovery_otp(self._e_otp.get())
+
+        if r.get("authenticated"):
+            self.app.fallback_session = None
+            self.app.needs_reenroll   = True
+            self.app.auth_verified    = False
+            self.app.show("success")
+        elif r.get("failed"):
+            self.app.fallback_session = None
+            self._render()
+        elif r.get("expired"):
+            self.msg(self._otp_msg, r["message"], "warn")
+        else:
+            self.msg(self._otp_msg, r["message"], "err")
 
     def _build_fail(self, p):
         self.msg(p, "Fallback failed. Contact support to reset your account.", "err")
         self.make_btn(p, "BACK TO LOGIN",
                       lambda: self.app.show("login")).pack(fill="x", pady=(12,0))
 
-    def _cancel(self):
+    def _back(self):
+        """Go back to login and reset attempts so user gets another 3 tries."""
         self.app.fallback_session = None
+        self.app.failed_attempts  = 0
         self.app.show("login")
 
 
@@ -1157,13 +1322,14 @@ class SuccessScreen(BaseFrame):
                      text_color=C_GREEN).pack()
         ctk.CTkLabel(wrap, text="authentication successful",
                      font=ctk.CTkFont(family="Courier", size=11),
-                     text_color="#2d3748").pack(pady=(4,0))
+                     text_color=C_DIM).pack(pady=(4,0))
 
-        self._rhythm_lbl = ctk.CTkLabel(
+        # SECURITY: No confidence or score shown — only verified status
+        self._status_lbl = ctk.CTkLabel(
             wrap, text="",
             font=ctk.CTkFont(family="Courier", size=12),
             text_color=C_GREEN)
-        self._rhythm_lbl.pack(pady=(12,0))
+        self._status_lbl.pack(pady=(12,0))
 
         self._timeout_lbl = ctk.CTkLabel(
             wrap, text="",
@@ -1175,20 +1341,28 @@ class SuccessScreen(BaseFrame):
         self._reenroll_card.pack(fill="x", pady=12)
 
         ctk.CTkLabel(wrap, text="", height=8).pack()
+
+        # ── Re-enroll rhythm button ──
+        self.make_btn(wrap, "RE-ENROLL RHYTHM", self._manual_reenroll,
+                      color="#1a2a1a",
+                      text_color="#66bb6a").pack(fill="x", pady=(0,4))
+        ctk.CTkLabel(wrap,
+                     text="Re-capture your typing rhythm (keeps questions & contact)",
+                     font=ctk.CTkFont(size=10),
+                     text_color=C_SUB).pack(pady=(0,8))
+
         self.make_btn(wrap, "SIGN OUT", self._sign_out,
                       color=C_BORDER, text_color=C_TEXT).pack(
                       fill="x", pady=4)
 
     def on_show(self):
-        rr = self.app.rhythm_result
-        if rr and rr.get("confidence"):
-            src  = "(real capture)" if rr.get("real") else "(simulated)"
-            conf = round(rr["confidence"] * 100, 1)
-            self._rhythm_lbl.configure(
-                text=f"Rhythm verified ✓   Mood: {rr['mood']}   "
-                     f"Confidence: {conf}%  {src}")
+        # SECURITY: Only show verified/not-verified — no score/confidence
+        if self.app.auth_verified:
+            self._status_lbl.configure(
+                text="Rhythm verified ✓",
+                text_color=C_GREEN)
         else:
-            self._rhythm_lbl.configure(text="")
+            self._status_lbl.configure(text="")
 
         # Re-enroll prompt
         for w in self._reenroll_card.winfo_children(): w.destroy()
@@ -1229,13 +1403,52 @@ class SuccessScreen(BaseFrame):
         self._timer_id = self.after(1000, self._tick)
 
     def _reenroll(self):
+        """Called after rhythm failed at login — forced re-enroll."""
         self.app.needs_reenroll = False
         if self._timer_id: self.after_cancel(self._timer_id)
-        enroll = self.app.frames["enroll"]
-        enroll._step         = 2
-        enroll._mood_idx     = 0
-        enroll._mood_samples = {}
-        self.app.show("enroll")
+
+        # Set up state directly — bypass on_show() to keep _step = 2
+        enroll                 = self.app.frames["enroll"]
+        enroll._step           = 2
+        enroll._samples        = []
+        enroll._enroll_session = None
+        enroll._rhythm_only    = True
+        enroll._password       = ""
+        enroll._capture        = KeystrokeCapture()
+        enroll.tkraise()
+        enroll._render()
+
+    def _manual_reenroll(self):
+        """
+        Manual re-enroll triggered by user from success screen.
+        Clears only model data from the saved profile.
+        Keeps password, security questions, and trusted contact intact.
+        Jumps straight to Step 2 (rhythm capture).
+        """
+        if self._timer_id: self.after_cancel(self._timer_id)
+
+        # Clear model data from saved profile — keep everything else
+        profile = self.app.profile or {}
+        profile["model_data"]    = []
+        profile["model_enrolled"] = False
+        save_profile(profile)
+        self.app.profile    = profile
+        self.app.auth_model = None
+        self.app.model_data = []
+
+        # Set up state directly — bypass on_show() to keep _step = 2
+        enroll                 = self.app.frames["enroll"]
+        enroll._step           = 2
+        enroll._samples        = []
+        enroll._enroll_session = None
+        enroll._rhythm_only    = True
+        enroll._password       = ""
+        enroll._capture        = KeystrokeCapture()
+        enroll._fe = FallbackEnrollment.from_dict(
+            profile.get("fallback", {}))
+        self.app.needs_reenroll = False
+        enroll.tkraise()
+        enroll._render()
 
     def _skip_reenroll(self):
         self.app.needs_reenroll = False
@@ -1244,7 +1457,7 @@ class SuccessScreen(BaseFrame):
     def _sign_out(self):
         if self._timer_id: self.after_cancel(self._timer_id)
         self.app.failed_attempts  = 0
-        self.app.rhythm_result    = None
+        self.app.auth_verified    = False
         self.app.needs_reenroll   = False
         self.app.fallback_session = None
         self.app.show("login")
@@ -1258,27 +1471,35 @@ class KeyDNAApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        ctk.set_appearance_mode("dark")
+        self.current_theme = _load_theme()
+        ctk.set_appearance_mode(self.current_theme)
         ctk.set_default_color_theme("blue")
 
         self.title("KeyDNA — Behavioral Authentication")
-        self.geometry("520x680")
-        self.resizable(False, False)
+        self.geometry(WINDOW_DEFAULT_GEOMETRY)
+        self.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.resizable(True, True)
         self.configure(fg_color=C_BG)
+
+        # Theme toggle button
+        self.theme_btn = ctk.CTkButton(
+            self, text="☀️" if self.current_theme == "dark" else "🌙",
+            width=30, height=30, fg_color="transparent", hover_color=C_BORDER,
+            command=self.toggle_theme
+        )
+        self.theme_btn.place(relx=0.95, rely=0.02, anchor="ne")
 
         # App state
         self.profile          = load_profile()
         self.failed_attempts  = 0
-        self.rhythm_result    = None
+        self.auth_verified    = False
         self.needs_reenroll   = False
         self.fallback_session = None
-        self.knn              = None
-        self.knn_data_ser     = {}
+        self.auth_model       = None
+        self.model_data       = []
         self.session_start    = time.time()
 
-        # Train mood classifier on startup (background thread)
-        self.mood_classifier  = None
-        threading.Thread(target=self._train_mc, daemon=True).start()
+        # NO mood classifier — unified model only
 
         # Grid
         self.grid_rowconfigure(0, weight=1)
@@ -1294,14 +1515,15 @@ class KeyDNAApp(ctk.CTk):
 
         self.show("login")
 
-    def _train_mc(self):
-        mc = MoodClassifier()
-        mc.train(samples_per_mood=300)
-        self.mood_classifier = mc
-
     def show(self, name: str):
         frame = self.frames[name]
         frame.show()
+
+    def toggle_theme(self):
+        self.current_theme = "light" if self.current_theme == "dark" else "dark"
+        ctk.set_appearance_mode(self.current_theme)
+        self.theme_btn.configure(text="☀️" if self.current_theme == "dark" else "🌙")
+        _save_theme(self.current_theme)
 
 
 # ═══════════════════════════════════════════════════════════════════════

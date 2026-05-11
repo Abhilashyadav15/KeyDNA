@@ -1,18 +1,22 @@
 """
-KeyDNA — Evaluation & Benchmarking
+KeyDNA — Evaluation & Benchmarking (v2 — Unified Model)
 
-Compares KeyDNA against basic single-cluster KNN.
-Measures FAR, FRR, EER, replay detection rate.
-Generates all benchmark results for dashboard.
+Tests the unified authentication model:
+  - FAR (False Acceptance Rate)
+  - FRR (False Rejection Rate)
+  - EER (Equal Error Rate)
+  - Replay attack detection rate
+  - Adaptive attack detection
+  - Mimicry resistance (sequence features)
+
+No mood classifier. No KNN. Hybrid distance scoring only.
 """
 
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from core.capture import SimulatedCapture
 from core.features import FeatureExtractor
-from models.mood_classifier import MoodClassifier, MOODS
-from models.knn_auth import KNNAuthenticator
-from enrollment.enroller import Enroller
+from models.auth_model import UnifiedAuthModel
 
 
 class BenchmarkResult:
@@ -38,8 +42,8 @@ class BenchmarkResult:
 
 class Evaluator:
     """
-    Runs benchmarks comparing KeyDNA vs basic KNN.
-    Uses simulated keystroke data for fair comparison.
+    Runs benchmarks for the KeyDNA unified authentication model.
+    Uses simulated keystroke data for reproducible evaluation.
     """
 
     def __init__(self):
@@ -48,284 +52,210 @@ class Evaluator:
 
     def run_full_benchmark(self) -> Dict:
         """
-        Run complete benchmark comparison.
-        Returns results for both algorithms.
+        Run complete benchmark evaluation.
+        Returns results for KeyDNA unified model.
         """
         results = {}
 
-        # Generate user profiles for testing
+        # Generate test user profiles
         user_profiles = self._generate_test_users(n_users=10)
 
-        # Run KeyDNA (mood-aware)
-        results['KeyDNA'] = self._benchmark_keydna(user_profiles)
+        # Run KeyDNA unified model benchmark
+        results['KeyDNA Unified'] = self._benchmark_unified(user_profiles)
 
-        # Run Basic KNN (single cluster, no mood)
-        results['Basic KNN'] = self._benchmark_basic_knn(user_profiles)
-
-        # Run replay attack test for both
-        replay_results = self._benchmark_replay_detection(user_profiles)
-        results['KeyDNA'].replay_caught    = replay_results['keydna']
-        results['Basic KNN'].replay_caught = replay_results['basic']
+        # Run replay attack test
+        replay_rate = self._benchmark_replay_detection(user_profiles)
+        results['KeyDNA Unified'].replay_caught = replay_rate
 
         return {k: v.to_dict() for k, v in results.items()}
 
     def _generate_test_users(self, n_users: int = 10) -> List[Dict]:
-        """Generate synthetic user profiles with mood variation."""
+        """
+        Generate synthetic user profiles with natural variation.
+        Each user has a unique base typing speed and style.
+        """
         users = []
-
-        mood_params = {
-            'RELAXED':  {'avg': 115, 'var': 13, 'dwell': 87,  'error': 0.01},
-            'FOCUSED':  {'avg': 87,  'var': 10, 'dwell': 70,  'error': 0.008},
-            'STRESSED': {'avg': 67,  'var': 30, 'dwell': 52,  'error': 0.08},
-            'TIRED':    {'avg': 155, 'var': 18, 'dwell': 110, 'error': 0.05},
-        }
 
         for user_id in range(n_users):
             # Each user has unique base speed (±20% personal variation)
             base_multiplier = 0.8 + (user_id * 0.04)
-            user_profiles = {}
+            base_var    = 12 + (user_id % 5) * 2
+            base_dwell  = 75 + (user_id % 4) * 5
+            base_error  = 0.01 + (user_id % 3) * 0.01
 
-            for mood, params in mood_params.items():
-                samples = []
-                for i in range(15):
-                    events = self.capture.simulate_typing(
-                        avg_speed_ms=params['avg'] * base_multiplier,
-                        variance_ms=params['var'],
-                        dwell_ms=params['dwell'] * base_multiplier,
-                        n_keys=10,
-                        error_rate=params['error'],
-                        seed=user_id * 1000 + hash(mood) % 100 + i
-                    )
-                    features = self.extractor.extract(events)
-                    if features is not None:
-                        samples.append(features)
+            enrollment_samples = []
+            test_samples       = []
 
-                user_profiles[mood] = samples
+            # Generate 10 enrollment + 10 test samples with natural variation
+            for i in range(20):
+                # Natural variation across attempts
+                variation = 1.0 + np.random.RandomState(user_id * 100 + i).normal(0, 0.08)
+
+                events = self.capture.simulate_typing(
+                    avg_speed_ms=100 * base_multiplier * variation,
+                    variance_ms=base_var * max(0.5, variation),
+                    dwell_ms=base_dwell * base_multiplier * variation,
+                    n_keys=10,
+                    error_rate=base_error,
+                    seed=user_id * 1000 + i
+                )
+                features = self.extractor.extract(events)
+                if features is not None:
+                    if i < 10:
+                        enrollment_samples.append(features)
+                    else:
+                        test_samples.append(features)
 
             users.append({
                 'user_id':    user_id,
-                'profiles':   user_profiles,
+                'enrollment': enrollment_samples,
+                'test':       test_samples,
                 'multiplier': base_multiplier,
             })
 
         return users
 
-    def _benchmark_keydna(self, users: List[Dict]) -> BenchmarkResult:
-        """Benchmark KeyDNA with mood-separated clusters."""
-        result = BenchmarkResult('KeyDNA')
+    def _benchmark_unified(self, users: List[Dict]) -> BenchmarkResult:
+        """Benchmark KeyDNA unified model with proper EER via threshold sweep."""
+        result = BenchmarkResult('KeyDNA Unified')
 
-        false_accepts = 0
-        false_rejects = 0
-        total_genuine = 0
-        total_impostor = 0
-
-        mood_params = {
-            'RELAXED':  {'avg': 115, 'var': 13, 'dwell': 87,  'error': 0.01},
-            'FOCUSED':  {'avg': 87,  'var': 10, 'dwell': 70,  'error': 0.008},
-            'STRESSED': {'avg': 67,  'var': 30, 'dwell': 52,  'error': 0.08},
-            'TIRED':    {'avg': 155, 'var': 18, 'dwell': 110, 'error': 0.05},
-        }
+        genuine_scores:  List[float] = []
+        impostor_scores: List[float] = []
 
         for user in users:
-            # Setup KeyDNA for this user
-            knn = KNNAuthenticator()
-            for mood, samples in user['profiles'].items():
-                for sample in samples:
-                    knn.enroll(sample, mood)
+            # Build unified model from enrollment samples
+            model = UnifiedAuthModel()
+            for sample in user['enrollment']:
+                model.enroll(sample)
 
-            # Genuine tests (same user, each mood)
-            for mood, params in mood_params.items():
-                for test_i in range(10):
-                    events = self.capture.simulate_typing(
-                        avg_speed_ms=params['avg'] * user['multiplier'],
-                        variance_ms=params['var'] * 1.1,  # slight variation
-                        dwell_ms=params['dwell'] * user['multiplier'],
-                        n_keys=10,
-                        error_rate=params['error'],
-                        seed=99999 + user['user_id'] * 100 + test_i
-                    )
-                    features = self.extractor.extract(events)
-                    if features is None:
-                        continue
-
-                    auth = knn.authenticate(features, mood, 0.85)
-                    total_genuine += 1
-                    if auth['decision'] == 'REJECT':
-                        false_rejects += 1
-
-            # Impostor tests (different user attacking)
-            impostor = users[(user['user_id'] + 1) % len(users)]
-            for mood in MOODS:
-                imp_params = mood_params[mood]
-                for test_i in range(5):
-                    events = self.capture.simulate_typing(
-                        avg_speed_ms=imp_params['avg'] * impostor['multiplier'],
-                        variance_ms=imp_params['var'],
-                        dwell_ms=imp_params['dwell'] * impostor['multiplier'],
-                        n_keys=10,
-                        error_rate=imp_params['error'],
-                        seed=88888 + impostor['user_id'] * 50 + test_i
-                    )
-                    features = self.extractor.extract(events)
-                    if features is None:
-                        continue
-
-                    auth = knn.authenticate(features, mood, 0.80)
-                    total_impostor += 1
-                    if auth['decision'] == 'ACCEPT':
-                        false_accepts += 1
-
-        result.far = false_accepts / max(total_impostor, 1)
-        result.frr = false_rejects / max(total_genuine, 1)
-        result.eer = (result.far + result.frr) / 2
-        result.total_tests = total_genuine + total_impostor
-        return result
-
-    def _benchmark_basic_knn(self, users: List[Dict]) -> BenchmarkResult:
-        """Benchmark basic single-cluster KNN (no mood separation)."""
-        from sklearn.neighbors import KNeighborsClassifier
-        from sklearn.preprocessing import StandardScaler
-
-        result = BenchmarkResult('Basic KNN')
-
-        mood_params = {
-            'RELAXED':  {'avg': 115, 'var': 13, 'dwell': 87,  'error': 0.01},
-            'FOCUSED':  {'avg': 87,  'var': 10, 'dwell': 70,  'error': 0.008},
-            'STRESSED': {'avg': 67,  'var': 30, 'dwell': 52,  'error': 0.08},
-            'TIRED':    {'avg': 155, 'var': 18, 'dwell': 110, 'error': 0.05},
-        }
-
-        false_accepts = 0
-        false_rejects = 0
-        total_genuine = 0
-        total_impostor = 0
-
-        for user in users:
-            # Combine ALL mood samples into ONE cluster (basic approach)
-            all_samples = []
-            for mood_samples in user['profiles'].values():
-                all_samples.extend(mood_samples)
-
-            if len(all_samples) < 5:
+            if not model.is_ready:
                 continue
 
-            X = np.array(all_samples)
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
-            center = np.mean(X_scaled, axis=0)
-            # Threshold = 2 std devs from center
-            distances = np.linalg.norm(X_scaled - center, axis=1)
-            threshold = np.mean(distances) + 2 * np.std(distances)
+            # ── Genuine tests (same user, new samples) ──
+            for test_sample in user['test']:
+                X = test_sample.reshape(1, -1)
+                score = float(model._model.decision_function(X)[0])
+                genuine_scores.append(score)
 
-            def basic_auth(features):
-                scaled = scaler.transform(features.reshape(1, -1))
-                dist = np.linalg.norm(scaled - center)
-                return dist <= threshold
-
-            # Genuine tests
-            for mood, params in mood_params.items():
-                for test_i in range(10):
-                    events = self.capture.simulate_typing(
-                        avg_speed_ms=params['avg'] * user['multiplier'],
-                        variance_ms=params['var'] * 1.1,
-                        dwell_ms=params['dwell'] * user['multiplier'],
-                        n_keys=10,
-                        error_rate=params['error'],
-                        seed=99999 + user['user_id'] * 100 + test_i
-                    )
-                    features = self.extractor.extract(events)
-                    if features is None:
-                        continue
-
-                    total_genuine += 1
-                    if not basic_auth(features):
-                        false_rejects += 1
-
-            # Impostor tests
+            # ── Impostor tests (different user attacking) ──
             impostor = users[(user['user_id'] + 1) % len(users)]
-            for mood in MOODS:
-                imp_params = mood_params[mood]
-                for test_i in range(5):
-                    events = self.capture.simulate_typing(
-                        avg_speed_ms=imp_params['avg'] * impostor['multiplier'],
-                        variance_ms=imp_params['var'],
-                        dwell_ms=imp_params['dwell'] * impostor['multiplier'],
-                        n_keys=10,
-                        error_rate=imp_params['error'],
-                        seed=88888 + impostor['user_id'] * 50 + test_i
-                    )
-                    features = self.extractor.extract(events)
-                    if features is None:
-                        continue
+            for imp_sample in impostor['test']:
+                X = imp_sample.reshape(1, -1)
+                score = float(model._model.decision_function(X)[0])
+                impostor_scores.append(score)
 
-                    total_impostor += 1
-                    if basic_auth(features):
-                        false_accepts += 1
+        # FAR/FRR at current operational threshold (THRESHOLD_ACCEPT = 0.0)
+        from config import THRESHOLD_ACCEPT
+        result.far = sum(1 for s in impostor_scores if s > THRESHOLD_ACCEPT) / max(len(impostor_scores), 1)
+        result.frr = sum(1 for s in genuine_scores if s <= THRESHOLD_ACCEPT) / max(len(genuine_scores), 1)
 
-        result.far = false_accepts / max(total_impostor, 1)
-        result.frr = false_rejects / max(total_genuine, 1)
-        result.eer = (result.far + result.frr) / 2
-        result.total_tests = total_genuine + total_impostor
+        # Proper EER: sweep thresholds to find FAR == FRR crossing
+        result.eer = self._compute_eer(genuine_scores, impostor_scores)
+        result.total_tests = len(genuine_scores) + len(impostor_scores)
         return result
 
-    def _benchmark_replay_detection(self, users: List[Dict]) -> Dict:
-        """Test replay attack detection for both algorithms."""
-        keydna_caught = 0
-        basic_caught  = 0
-        total_replays = 0
+    @staticmethod
+    def _compute_eer(genuine: List[float], impostor: List[float]) -> float:
+        """Compute Equal Error Rate by sweeping thresholds on the DET curve."""
+        if not genuine or not impostor:
+            return 0.0
 
-        for user in users[:3]:  # test on 3 users
-            knn = KNNAuthenticator()
-            for mood, samples in user['profiles'].items():
-                for sample in samples:
-                    knn.enroll(sample, mood)
+        thresholds = sorted(set(genuine + impostor))
+        best_diff  = float('inf')
+        eer        = 0.0
 
-            # Simulate replay: take real sample and make it TOO consistent
-            real_sample = user['profiles']['FOCUSED'][0].copy()
-            # Make consistency score artificially high (replay attack)
-            real_sample[11] = 0.985  # index 11 = consistency score
+        for t in thresholds:
+            far = sum(1 for s in impostor if s > t) / len(impostor)
+            frr = sum(1 for s in genuine  if s <= t) / len(genuine)
+            diff = abs(far - frr)
+            if diff < best_diff:
+                best_diff = diff
+                eer = (far + frr) / 2.0
 
-            total_replays += 1
+        return eer
 
-            # KeyDNA: checks consistency score ceiling
-            auth = knn.authenticate(real_sample, 'FOCUSED', 0.85)
-            if auth.get('replay_detected') or auth['decision'] == 'REJECT':
-                keydna_caught += 1
+    def _benchmark_replay_detection(self, users: List[Dict]) -> float:
+        """
+        Test replay attack detection.
+        Simulates replay by setting consistency score > 0.97.
+        """
+        caught = 0
+        total  = 0
 
-            # Basic KNN: no replay detection
-            # Would accept because distance is small
+        for user in users[:5]:
+            model = UnifiedAuthModel()
+            for sample in user['enrollment']:
+                model.enroll(sample)
 
+            if not model.is_ready:
+                continue
+
+            # Simulate replay: copy a real sample, make consistency too high
+            for real_sample in user['enrollment'][:3]:
+                replayed = real_sample.copy()
+                replayed[11] = 0.985  # consistency score = too perfect
+                total += 1
+
+                model.reset_attack_tracking()
+                auth = model.authenticate(replayed)
+                if auth.get('replay_detected') or auth['decision'] == 'REJECT':
+                    caught += 1
+
+        return caught / max(total, 1)
+
+    def _benchmark_mimicry_resistance(self, users: List[Dict]) -> Dict:
+        """
+        Test resistance to human mimicry attempts.
+        Simulates attacker who matches global features but not sequence.
+        """
+        mimicry_rejected = 0
+        total_mimicry    = 0
+
+        for user in users[:5]:
+            model = UnifiedAuthModel()
+            for sample in user['enrollment']:
+                model.enroll(sample)
+
+            if not model.is_ready:
+                continue
+
+            # Simulate mimicry: copy global features from user,
+            # but sequence features are from attacker
+            impostor = users[(user['user_id'] + 3) % len(users)]
+            for imp_sample in impostor['test'][:3]:
+                mimic = user['enrollment'][0].copy()
+                # Copy global features (0-16) from genuine user
+                # But sequence features (17-26) from impostor
+                mimic[17:] = imp_sample[17:]
+                total_mimicry += 1
+
+                model.reset_attack_tracking()
+                auth = model.authenticate(mimic)
+                if auth['decision'] != 'ACCEPT':
+                    mimicry_rejected += 1
+
+        rejection_rate = mimicry_rejected / max(total_mimicry, 1)
         return {
-            'keydna': keydna_caught / max(total_replays, 1),
-            'basic':  0.0,  # basic KNN has no replay detection
+            'mimicry_rejection_rate': round(rejection_rate * 100, 2),
+            'total_tests':           total_mimicry,
         }
 
-    def run_mood_accuracy_test(self) -> Dict:
-        """Test mood classifier accuracy."""
-        classifier = MoodClassifier()
-        X, y = classifier.generate_training_data(samples_per_mood=200)
-        accuracy = classifier.train(X, y)
+    def run_comprehensive_report(self) -> Dict:
+        """
+        Run all benchmarks and return comprehensive report.
+        """
+        users = self._generate_test_users(n_users=10)
 
-        # Per-mood accuracy
-        from sklearn.model_selection import train_test_split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, stratify=y, random_state=42
-        )
-        classifier_test = MoodClassifier()
-        classifier_test.train(X_train, y_train)
+        unified_result = self._benchmark_unified(users)
+        replay_rate    = self._benchmark_replay_detection(users)
+        mimicry_result = self._benchmark_mimicry_resistance(users)
 
-        X_test_scaled = classifier_test.scaler.transform(X_test)
-        y_pred = classifier_test.model.predict(X_test_scaled)
-
-        per_mood = {}
-        for i, mood in enumerate(MOODS):
-            mask = y_test == i
-            if mask.sum() > 0:
-                correct = (y_pred[mask] == i).sum()
-                per_mood[mood] = round(correct / mask.sum() * 100, 1)
+        unified_result.replay_caught = replay_rate
 
         return {
-            'overall_accuracy': round(accuracy * 100, 1),
-            'per_mood':         per_mood,
-            'training_samples': len(X),
+            'authentication': unified_result.to_dict(),
+            'replay_detection': {
+                'detection_rate': round(replay_rate * 100, 2),
+            },
+            'mimicry_resistance': mimicry_result,
         }
